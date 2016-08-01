@@ -9,11 +9,15 @@
 %% ====================================================================
 %% API functions
 %% ====================================================================
--export([start/0, stop/0, calls/2, calls/3]).
+-export([start/0, start/1, stop/0, calls/2, calls/3]).
 
 start() ->
 	recon_trace:clear(),
 	gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+start(Args) ->
+	recon_trace:clear(),
+	gen_server:start_link({local, ?MODULE}, ?MODULE, Args, []).
 
 stop() ->
 	gen_server:call(?MODULE, stop).
@@ -52,8 +56,12 @@ calls(TSpecs = [_|_], Max, Opts) ->
 init([]) ->
 	{ok, Socket} = gen_tcp:connect("localhost", ?PORT_NUM, [binary], 1000),
 	{ok, Device} = tcp_io_server:start(Socket),
+    {ok, #state{socket=Socket, device=Device}};
+init(Args) ->
+	Ip = Args,
+	{ok, Socket} = gen_tcp:connect(Ip, ?PORT_NUM, [binary], 1000),
+	{ok, Device} = tcp_io_server:start(Socket),
     {ok, #state{socket=Socket, device=Device}}.
-
 
 %% handle_call/3
 %% ====================================================================
