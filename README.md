@@ -9,3 +9,21 @@ Providing erlang trace for cluster.
 * logger_client.erl
 * logger_client2.erl
 * logger_server.erl
+
+##guide
+```erlang
+%% start the logger_server.
+logger_server:start().
+```
+```erlang
+logger_client2:start().
+logger_client2:calls({lists,last,fun(_) -> return_trace() end}, 100).
+
+%% traced function start 
+lists:last([1,2,3,4,5]).
+lists:last([1,2,3,4,5,6]).
+lists:last([1,2,3,4,5,6,7]).
+%% traced function end
+
+logger_client:stop().
+```
