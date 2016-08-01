@@ -499,6 +499,7 @@ validate_io_server(Opts) ->
 %%%%%%%%%%%%%%%%%%%%%%%%
 %% Thanks Geoff Cant for the foundations for this.
 format(TraceMsg) ->
+    Node = erlang:node(),
     {Type, Pid, {Hour,Min,Sec}, TraceInfo} = extract_info(TraceMsg),
     {FormatStr, FormatArgs} = case {Type, TraceInfo} of
         %% {trace, Pid, 'receive', Msg}
@@ -573,8 +574,8 @@ format(TraceMsg) ->
         _ ->
             {"unknown trace type ~p -- ~p", [Type, TraceInfo]}
     end,
-    io_lib:format("~p:~p:~9.6.0f ~p " ++ FormatStr ++ "~n",
-                  [Hour, Min, Sec, Pid] ++ FormatArgs).
+    io_lib:format("(~p)>~p:~p:~9.6.0f ~p " ++ FormatStr ++ "~n",
+                  [Node, Hour, Min, Sec, Pid] ++ FormatArgs).
 
 extract_info(TraceMsg) ->
     case tuple_to_list(TraceMsg) of
