@@ -1,42 +1,71 @@
 -module(ets_io_server).
 
--export([start_link/0, init/0, loop/1, until_newline/3, until_enough/3]).
+-export([start/0, start_link/0, init/0, loop/1, stop/1]).
 
--define(CHARS_PER_REC, 10).
+-define(MAX_INDEX, 100).
+-define(MAX_TABLE, 4).
+-define(TABLE_NAME, log_buffer).
 
 -record(state, {
-	  table,
-	  position, % absolute
-	  mode % binary | list
+          table,
+          index,  %% the index in table
+          table_p_index, %% store current table index that is used to record log
+          table_c_index, %% store current table index that is ready to send log
+	  mode, % binary | list
+          handler,
+          plc,
+          sending
 	 }).
 
 start_link() ->
-    spawn_link(?MODULE,init,[]).
+    Pid = spawn_link(?MODULE,init,[]),
+    {ok, Pid}.
+
+start() ->
+    Pid = spawn(?MODULE,init,[]),
+    {ok, Pid}.
+
+stop(Pid) -> 
+    Pid!stop.
 
 init() ->
-    Table = ets:new(noname,[ordered_set]),
-    ?MODULE:loop(#state{table = Table, position = 0, mode=list}).
+    {ok, Handler} = sender:start(),
+    [ets:new(get_table_name(Index),[public, named_table, ordered_set]) || Index <- lists:seq(1, ?MAX_TABLE)],
+    Table = get_table_name(1),
+    ?MODULE:loop(#state{table=Table, index=0, table_p_index=1, table_c_index=1, mode=list, handler=Handler, plc=false, sending=false}).
 
-loop(State) ->
+loop(#state{index=?MAX_INDEX, table_p_index=TPI, table_c_index=TCI, handler=Handler}=State) ->
     receive
-	{io_request, From, ReplyAs, Request} ->
-	    case request(Request,State) of
-		{Tag, Reply, NewState} when Tag =:= ok; Tag =:= error ->
-		    reply(From, ReplyAs, Reply),
+        {io_request, From, ReplyAs, Request} ->
+             case request(Request,State) of
+	        {Tag, Reply, NewState} when Tag =:= ok; Tag =:= error ->
+                    reply(From, ReplyAs, Reply),
 		    ?MODULE:loop(NewState);
-		{stop, Reply, _NewState} ->
-		    reply(From, ReplyAs, Reply),
-		    exit(Reply)
+                {stop, Reply, _NewState} ->
+                    reply(From, ReplyAs, Reply),
+                    exit(Reply)
 	    end;
-	%% Private message
-	{From, rewind} ->
-	    From ! {self(), ok},
-	    ?MODULE:loop(State#state{position = 0});
-	ets_list ->
-		io:format("ets data contains~n~p~n", [ets:tab2list(State#state.table)]),
-		?MODULE:loop(State);
-	_Unknown ->
-	    ?MODULE:loop(State)
+	stop ->
+            stop;
+	{sent_done, Table} ->
+            ets:delete_all_objects(Table),
+            NewTable=get_next_table(TCI),
+            NewTCI=get_next_table_index(TCI),
+            Plc = is_plc_overload(TPI, NewTCI),
+            Result = send_table_data(NewTable, Handler),
+            case Result of
+                paused ->
+                    NewState=State#state{table_c_index=NewTCI,plc=Plc, sending=false};
+                _ ->
+                    NewState=State#state{table_c_index=NewTCI,plc=Plc}
+            end,
+            ?MODULE:loop(NewState);
+        {stop_done} ->	
+             [ets:delete(get_table_name(Index)) || Index <- lists:seq(1, ?MAX_TABLE)],
+             sender:stop(Handler),
+             done;
+        _Unknown ->
+             ?MODULE:loop(State)
     end.
 
 reply(From, ReplyAs, Reply) ->
@@ -46,205 +75,66 @@ request({put_chars, Encoding, Chars}, State) ->
     put_chars(unicode:characters_to_list(Chars,Encoding),State);
 request({put_chars, Encoding, Module, Function, Args}, State) ->
     try
-	request({put_chars, Encoding, apply(Module, Function, Args)}, State)
+        request({put_chars, Encoding, apply(Module, Function, Args)}, State)
     catch
-	_:_ ->
-	    {error, {error,Function}, State}
+        _:_ ->
+            {error, {error,Function}, State}
     end;
-
-request({get_until, Encoding, _Prompt, M, F, As}, State) ->
-    get_until(Encoding, M, F, As, State);
-request({get_chars, Encoding, _Prompt, N}, State) ->
-    %% To simplify the code, get_chars is implemented using get_until
-    get_until(Encoding, ?MODULE, until_enough, [N], State);
-request({get_line, Encoding, _Prompt}, State) ->
-    %% To simplify the code, get_line is implemented using get_until
-    get_until(Encoding, ?MODULE, until_newline, [$\n], State);
-
-request({get_geometry,_}, State) ->
-    {error, {error,enotsup}, State};
-request({setopts, Opts}, State) ->
-    setopts(Opts, State);
-request(getopts, State) ->
-    getopts(State);
-request({requests, Reqs}, State) ->
-     multi_request(Reqs, {ok, ok, State});
-
-
 request({put_chars,Chars}, State) ->
     request({put_chars,latin1,Chars}, State);
 request({put_chars,M,F,As}, State) ->
     request({put_chars,latin1,M,F,As}, State);
-request({get_chars,Prompt,N}, State) ->
-    request({get_chars,latin1,Prompt,N}, State);
-request({get_line,Prompt}, State) ->
-    request({get_line,latin1,Prompt}, State);
-request({get_until, Prompt,M,F,As}, State) ->
-    request({get_until,latin1,Prompt,M,F,As}, State);
-
-
 request(_Other, State) ->
     {error, {error, request}, State}.
 
+put_chars(Chars, #state{index=?MAX_INDEX, table_p_index=TPI, table_c_index=TCI, handler=Handler, sending=Sending}=State) ->
+    Table = get_next_table(TPI),
+    NewTPI = get_next_table_index(TPI),
+    Plc = is_plc_overload(NewTPI, TCI),
+    case Sending of
+        true ->
+            NewState = State#state{index=0,table=Table,table_p_index=NewTPI,plc=Plc},
+            skip;
+        false ->
+            NewState = State#state{index=0,table=Table,table_p_index=NewTPI,plc=Plc, sending=true},
+	    send_table_data(get_table_name(TCI), Handler)
+    end,
+    put_chars(Chars, NewState);
+put_chars(Chars, #state{table=T, index=I}=State) ->
+    ets:insert(T, {I, Chars}),
+    {ok, ok, State#state{index=I+1}}.
 
-multi_request([R|Rs], {ok, _Res, State}) ->
-    multi_request(Rs, request(R, State));
-multi_request([_|_], Error) ->
-    Error;
-multi_request([], Result) ->
-    Result.
+get_table_name(Index) ->
+    list_to_atom(atom_to_list(?TABLE_NAME) ++ integer_to_list(Index)).
 
-setopts(Opts0,State) ->
-    Opts = proplists:unfold(
-	     proplists:substitute_negations(
-	       [{list,binary}], 
-	       Opts0)),
-    case check_valid_opts(Opts) of
-	true ->
-	        case proplists:get_value(binary, Opts) of
-		    true ->
-			{ok,ok,State#state{mode=binary}};
-		    false ->
-			{ok,ok,State#state{mode=binary}};
-		    _ ->
-			{ok,ok,State}
-		end;
-	false ->
-	    {error,{error,enotsup},State}
-    end.
-check_valid_opts([]) ->
-    true;
-check_valid_opts([{binary,Bool}|T]) when is_boolean(Bool) ->
-    check_valid_opts(T);
-check_valid_opts(_) ->
-    false.
+get_next_table_index(I) when I<?MAX_TABLE ->
+    I+1;
+get_next_table_index(_I) ->
+    1.
 
-getopts(#state{mode=M} = S) ->
-    {ok,[{binary, case M of
-		      binary ->
-			  true;
-		      _ ->
-			  false
-		  end}],S}.
+get_next_table(I) when I<?MAX_TABLE ->
+	get_table_name(I+1);
+get_next_table(_I) ->
+    get_table_name(1).
 
+get_free(T1, T2) when T1 > T2 ->
+    ?MAX_TABLE - (T1 - T2) - 1;
+get_free(T1, T2)->
+    T2 - T1 - 1.
 
-put_chars(Chars, #state{table = T, position = P} = State) ->
-    R = P div ?CHARS_PER_REC,
-    C = P rem ?CHARS_PER_REC,
-    [ apply_update(T,U) || U <- split_data(Chars, R, C) ],
-    {ok, ok, State#state{position = (P + length(Chars))}}.
-
-
-get_until(Encoding, Mod, Func, As, 
-	  #state{position = P, mode = M, table = T} = State) ->
-    case get_loop(Mod,Func,As,T,P,[]) of
-	{done,Data,_,NewP} when is_binary(Data); is_list(Data) ->
-	    if
-		M =:= binary -> 
-		    {ok, 
-		     unicode:characters_to_binary(Data, unicode, Encoding),
-		     State#state{position = NewP}};
-		true ->
-		    case check(Encoding, 
-		               unicode:characters_to_list(Data, unicode))
-                    of
-			{error, _} = E ->
-			    {error, E, State};
-			List ->
-			    {ok, List,
-			     State#state{position = NewP}}
-		    end
-	    end;
-	{done,Data,_,NewP} ->
-	    {ok, Data, State#state{position = NewP}};
-	Error ->
-	    {error, Error, State}
+is_plc_overload(T1, T2) ->
+    D = get_free(T1, T2),
+    case D of
+        0 -> stop;
+        1 -> yes;
+        _ -> no
     end.
 
-get_loop(M,F,A,T,P,C) ->
-    {NewP,L} = get(P,T),
-    case catch apply(M,F,[C,L|A]) of
-	{done, List, Rest} ->
-	    {done, List, [], NewP - length(Rest)};
-	{more, NewC} ->
-	    get_loop(M,F,A,T,NewP,NewC);
-	_ ->
-	    {error,F}
+send_table_data(Table, Handler) ->
+    TabSize = ets:info(Table, size),
+    case TabSize of
+        ?MAX_INDEX ->
+            Handler!{start_send, Table};
+        _ ->	
+            paused
     end.
-
-check(unicode, List) ->
-    List;
-check(latin1, List) ->
-    try 
-	[ throw(not_unicode) || X <- List,
-				X > 255 ],
-	List
-    catch
-	throw:_ ->
-	    {error,{cannot_convert, unicode, latin1}}
-    end.
-
-until_newline([],eof,_MyStopCharacter) ->
-    {done,eof,[]};
-until_newline(ThisFar,eof,_MyStopCharacter) ->
-    {done,ThisFar,[]};
-until_newline(ThisFar,CharList,MyStopCharacter) ->
-    case
-        lists:splitwith(fun(X) -> X =/= MyStopCharacter end,  CharList)
-    of
-	{L,[]} ->
-            {more,ThisFar++L};
-	{L2,[MyStopCharacter|Rest]} ->
-	    {done,ThisFar++L2++[MyStopCharacter],Rest}
-    end.
-
-until_enough([],eof,_N) ->
-    {done,eof,[]};
-until_enough(ThisFar,eof,_N) ->
-    {done,ThisFar,[]};
-until_enough(ThisFar,CharList,N) 
-  when length(ThisFar) + length(CharList) >= N ->
-    {Res,Rest} = my_split(N,ThisFar ++ CharList, []),
-    {done,Res,Rest};
-until_enough(ThisFar,CharList,_N) ->
-    {more,ThisFar++CharList}. 
-
-get(P,Tab) ->
-    R = P div ?CHARS_PER_REC,
-    C = P rem ?CHARS_PER_REC,
-    case ets:lookup(Tab,R) of
-	[] ->
-	    {P,eof};
-	[{R,List}] ->
-	    case my_split(C,List,[]) of
-		{_,[]} ->
-		    {P+length(List),eof};
-		{_,Data} ->
-		    {P+length(Data),Data}
-	    end
-    end.
-
-my_split(0,Left,Acc) ->
-    {lists:reverse(Acc),Left};
-my_split(_,[],Acc) ->
-    {lists:reverse(Acc),[]};
-my_split(N,[H|T],Acc) ->
-    my_split(N-1,T,[H|Acc]).
-
-split_data([],_,_) ->
-    [];
-split_data(Chars, Row, Col) ->
-    {This,Left} = my_split(?CHARS_PER_REC - Col, Chars, []),
-    [ {Row, Col, This} | split_data(Left, Row + 1, 0) ].
-
-apply_update(Table, {Row, Col, List}) ->     
-    case ets:lookup(Table,Row) of
-	[] ->
-	    ets:insert(Table,{Row, lists:duplicate(Col,0) ++ List});
-	[{Row, OldData}] ->
-	    {Part1,_} = my_split(Col,OldData,[]),
-	    {_,Part2} = my_split(Col+length(List),OldData,[]),
-	    ets:insert(Table,{Row, Part1 ++ List ++ Part2})
-    end.
-
-
