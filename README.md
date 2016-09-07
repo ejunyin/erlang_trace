@@ -9,6 +9,8 @@ Providing erlang trace for cluster.
 * logger_client.erl
 * logger_client2.erl
 * logger_server.erl
+* logger_collector.erl
+* logger_sender.erl
 
 ##guide
 ```erlang
