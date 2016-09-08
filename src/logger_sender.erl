@@ -29,7 +29,7 @@ stop(Pid) ->
 
 init() ->
     {ok, Socket} = gen_tcp:connect("localhost", ?PORT_NUM, [binary], 1000),
-    ?MODULE:loop(#state{socket=Socket, producer=undefined}).
+    ?MODULE:loop(#state{socket=Socket}).
 
 %%
 %%       logger_collector   logger_sender
@@ -50,12 +50,15 @@ loop(#state{socket=Socket, producer=Producer}=State) ->
         NewState=State#state{producer=Pid},
         ?MODULE:loop(NewState);
     {start_send, Table} ->
+        io:format("[sender] receive start_send  ~p~n", [State]),
         start_send(Table, Socket, Producer),
         ?MODULE:loop(State);
     {send_and_stop, Table} ->
+        io:format("[sender] receive send_and_stop  ~p~n", [State]),
         send_and_stop(Table, Socket, Producer),
         ?MODULE:loop(State);		
     stop ->
+        io:format("[sender] receive stop  ~p~n", [State]),
         gen_tcp:close(Socket),
         done;
     _Unknown ->
