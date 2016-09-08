@@ -30,11 +30,11 @@ stop(Pid) ->
     Pid!stop.
 
 init() ->
-    
+	{ok, Handler} = logger_sender:start_link(),
     [ets:new(get_table_name(Index),[public, named_table, ordered_set]) || Index <- lists:seq(1, ?MAX_TABLE)],
     Table = get_table_name(1),
     ?MODULE:loop(#state{table=Table, index=0, table_p_index=1, table_c_index=1, 
-                        mode=list, handler=undefined, plc=no, sending=false, stopped=false}).
+                        mode=list, handler=Handler, plc=no, sending=false, stopped=false}).
 
 %%
 %%       logger_collector   logger_sender
@@ -49,11 +49,12 @@ init() ->
 %%              |   stop_done    |
 %%              |<---------------|
 %%
-loop(#state{index=?MAX_INDEX, table_p_index=TPI, table_c_index=TCI, handler=Handler, sending=Sending, stopped=Stopped, plc=Plc}=State) ->
+loop(#state{table_p_index=TPI, table_c_index=TCI, handler=Handler, sending=Sending, stopped=Stopped, plc=Plc}=State) ->
     receive
     {io_request, From, ReplyAs, Request} ->
         case Plc of
             stop -> %% don't collect log any more.
+                io:format("[collector] drop log.  ~p~n", [State]),
                 ?MODULE:loop(State); 
             _ -> %% yes or no.
                 case request(Request,State) of
@@ -69,19 +70,20 @@ loop(#state{index=?MAX_INDEX, table_p_index=TPI, table_c_index=TCI, handler=Hand
         case Sending of
             false ->
                 NewState=State#state{plc=stop},
-                Handler ! {send_and_stop, TCI};
+                Handler ! {send_and_stop, get_table_name(TCI)};
             true ->
                 NewState=State#state{plc=stop, stopped=true}
         end,
         ?MODULE:loop(NewState);		
     {sent_done, Table} ->
+        io:format("[collector] receive sent_done.  ~p~n", [State]),
 		%% send ok, delete content in this table.
         ets:delete_all_objects(Table),
 		%% find the next sending table.
         NewTable=get_next_table(TCI),
         NewTCI=get_next_table_index(TCI),
 		%% plc status check
-        Plc = is_plc_overload(TPI, NewTCI),
+        NewPlc = is_plc_overload(TPI, NewTCI),
 		%% try to send data
         Result = send_table_data(NewTable, Handler),
         case Result of
@@ -90,35 +92,37 @@ loop(#state{index=?MAX_INDEX, table_p_index=TPI, table_c_index=TCI, handler=Hand
                 case Stopped of
                     %% don't need stop, continue. but it is paused,so set sending to false. 
                     false ->
-                        NewState=State#state{table_c_index=NewTCI,plc=Plc, sending=false},
+                        NewState=State#state{table_c_index=NewTCI,plc=NewPlc, sending=false},
 						?MODULE:loop(NewState);
                     true ->
                         Size = ets:info(TCI, size),
                         case Size of
                             0 -> 
                                 delete_all_table(),
-                                sender:stop(Handler),
+                                logger_sender:stop(Handler),
                                 done;
                             _ ->
                                 %% send the last table.
-                                Handler ! {send_and_stop, TCI},
+                                Handler ! {send_and_stop, get_table_name(TCI)},
                                 ?MODULE:loop(State)
                             end 
                     end;    
             _ ->
                 %% continue
-                NewState=State#state{table_c_index=NewTCI,plc=Plc},
+                NewState=State#state{table_c_index=NewTCI,plc=NewPlc},
                 ?MODULE:loop(NewState)
         end;
-    stop_done ->	
+    stop_done ->
+        io:format("[collector] receive stop_done.  ~p~n", [State]),
         delete_all_table(),
-        sender:stop(Handler),
+        logger_sender:stop(Handler),
         done;
     {set_handler, Pid} ->
-        {ok, Handler} = sender:start(),
-        NewState = State#state{handler=Handler},
-		Handler!{set_collector, Pid},
-        ?MODULE:loop(NewState);
+        Handler!{set_collector, Pid},
+        ?MODULE:loop(State);
+    state ->
+        io:format("~p~n", [State]),
+        ?MODULE:loop(State);
     _Unknown ->
         ?MODULE:loop(State)
     end.
@@ -186,23 +190,31 @@ get_next_table(I) when I<?MAX_TABLE ->
 get_next_table(_I) ->
     get_table_name(1).
 
-get_free(T1, T2) when T1 >= T2 ->
-    ?MAX_TABLE - (T1 - T2) - 1;
-get_free(T1, T2)->
-    T2 - T1 - 1.
+get_free(TP, TC) when TP >= TC ->
+    ?MAX_TABLE - (TP - TC) - 1;
+get_free(TP, TC)->
+    TC - TP - 1.
 
-is_plc_overload(T1, T2) ->
-    D = get_free(T1, T2),
-    case D of
-        0 -> stop; %% don't collect log any more
-        1 -> yes;  %% only collect high priority level log
-        _ -> %% no problem, go ahead
-            case {memory_overload(), cpu_overload()} of
-                {no, no} -> no;
-                {yes, no} -> yes;
-                {no, yes} -> yes;
-                {yes, yes} -> yes
-            end
+is_full(TP) ->
+    NewTPTable = get_next_table(TP),
+    TabSize = ets:info(NewTPTable, size),
+    case TabSize of
+        0 -> no;
+        _ -> yes
+    end.
+
+is_plc_overload(TP, TC) ->
+    F = is_full(TP),
+    D = get_free(TP, TC),
+    M = memory_overload(),
+    C = cpu_overload(),
+    io:format("*** current status {full, free, memory, cpu}:~n~p~n", [{F, D, M, C}]),
+    case {F, D, M, C} of
+        {yes, _, _, _} -> stop;
+        {no, 0, _, _} -> yes;
+        {no, 1, _, _} -> yes;
+        {no, _, no, no} -> no;
+        {no, _, _, _} -> yes		
     end.
 
 memory_overload() ->
