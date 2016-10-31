@@ -1,9 +1,9 @@
 -module(logger_collector).
 
--export([start/0, start_link/0, init/0, loop/1, stop/1]).
+-export([start/1, start_link/1, init/1, loop/1, stop/1]).
 
--define(MAX_INDEX, 100).
--define(MAX_TABLE, 4).
+-define(MAX_INDEX, 1000).
+-define(MAX_TABLE, 16).
 -define(TABLE_NAME, log_buffer).
 
 -record(state, {
@@ -13,28 +13,34 @@
     table_c_index, %% store current table index that is ready to send log
     mode, % binary | list
     handler,
-    plc,
+    plc,	%stop | yes | no
     sending,
-    stopped %% stop all, game over.
+    stopped, 
+    filtered,
+    tRef
  }).
 
-start_link() ->
-    Pid = spawn_link(?MODULE,init,[]),
+start_link(Args) ->
+    Pid = spawn_link(?MODULE,init,[Args]),
+    register(log_coll, Pid),
     {ok, Pid}.
 
-start() ->
-    Pid = spawn(?MODULE,init,[]),
+start(Args) ->
+    Pid = spawn(?MODULE,init,[Args]),
+    register(log_coll, Pid),
     {ok, Pid}.
 
 stop(Pid) -> 
     Pid!stop.
 
-init() ->
-	{ok, Handler} = logger_sender:start_link(),
+init(Args) ->
+    {ok, Handler} = logger_sender:start_link(Args),
     [ets:new(get_table_name(Index),[public, named_table, ordered_set]) || Index <- lists:seq(1, ?MAX_TABLE)],
     Table = get_table_name(1),
+    {ok, TRef} = timer:send_interval(2000, log_coll, check_resource),
     ?MODULE:loop(#state{table=Table, index=0, table_p_index=1, table_c_index=1, 
-                        mode=list, handler=Handler, plc=no, sending=false, stopped=false}).
+                        mode=list, handler=Handler, plc=no, sending=false, 
+			stopped=false, filtered=false, tRef=TRef}).
 
 %%
 %%       logger_collector   logger_sender
@@ -49,23 +55,59 @@ init() ->
 %%              |   stop_done    |
 %%              |<---------------|
 %%
-loop(#state{table_p_index=TPI, table_c_index=TCI, handler=Handler, sending=Sending, stopped=Stopped, plc=Plc}=State) ->
+loop(#state{table_p_index=TPI, table_c_index=TCI, handler=Handler, sending=Sending, 
+			stopped=Stopped, filtered=Filtered}=State) ->
     receive
     {io_request, From, ReplyAs, Request} ->
-        case Plc of
-            stop -> %% don't collect log any more.
-                io:format("[collector] drop log.  ~p~n", [State]),
-                ?MODULE:loop(State); 
-            _ -> %% yes or no.
-                case request(Request,State) of
-                    {Tag, Reply, NewState} when Tag =:= ok; Tag =:= error ->
-                        reply(From, ReplyAs, Reply),
-                        ?MODULE:loop(NewState);
-                    {stop, Reply, _NewState} ->
-                        reply(From, ReplyAs, Reply),
-                        exit(Reply)
-                end  
+        case request(Request,State) of
+            {Tag, Reply, NewState} when Tag =:= ok; Tag =:= error ->
+                reply(From, ReplyAs, Reply),
+                ?MODULE:loop(NewState);
+            {stop, Reply, _NewState} ->
+                reply(From, ReplyAs, Reply),
+                exit(Reply)
         end;
+	check_resource ->
+            Plc = is_plc_overload(TPI, TCI),
+            io:format("Plc value is ~p~n", [Plc]),
+            {NewFiltered, NewStopped} = 
+                case {Plc, Filtered, Stopped} of
+                    {no, false, false} ->
+                        {false, false};
+                    {no, true, false} ->
+                        logger_client:resume_low_priority_trace(),
+                        {false, false};
+                    {no, _, true} ->
+                        io:format("logger_client:no, resume_all_trace()~n"),
+                        logger_client:resume_all_trace(),
+                        {false, false};
+						 
+                    {yes, false, false} ->
+                        logger_client:stop_low_priority_trace(),
+                        {true, false};
+                    {yes, true, false} ->
+                        {true, false};
+                    {yes, _, true} ->
+                        io:format("logger_client:yes, resume_all_trace()~n"),
+                        logger_client:resume_all_trace(),
+                        logger_client:stop_low_priority_trace(),
+                        {true, false};
+						 
+                    {stop, false, false} ->
+                        io:format("logger_client:stop_all_trace()~n"),
+                        logger_client:stop_all_trace(),
+                        {true, true};
+                    {stop, true, true} ->
+                        {true, true};
+                    {stop, false, true} ->
+                        logger_client:stop_low_priority_trace(),
+                        {true, true};
+                    {stop, true, false} ->
+                        logger_client:stop_all_trace(),
+                        {true, true}
+                end,
+                NewState=State#state{stopped=NewStopped,filtered=NewFiltered},
+                ?MODULE:loop(NewState);
     stop ->
         case Sending of
             false ->
@@ -76,7 +118,7 @@ loop(#state{table_p_index=TPI, table_c_index=TCI, handler=Handler, sending=Sendi
         end,
         ?MODULE:loop(NewState);		
     {sent_done, Table} ->
-        io:format("[collector] receive sent_done.  ~p~n", [State]),
+        %io:format("[collector] receive sent_done.  ~p~n", [State]),
 		%% send ok, delete content in this table.
         ets:delete_all_objects(Table),
 		%% find the next sending table.
@@ -113,8 +155,9 @@ loop(#state{table_p_index=TPI, table_c_index=TCI, handler=Handler, sending=Sendi
                 ?MODULE:loop(NewState)
         end;
     stop_done ->
-        io:format("[collector] receive stop_done.  ~p~n", [State]),
+        %io:format("[collector] receive stop_done.  ~p~n", [State]),
         delete_all_table(),
+	timer:cancel(State#state.tRef),
         logger_sender:stop(Handler),
         done;
     {set_handler, Pid} ->
@@ -151,7 +194,9 @@ request(_Other, State) ->
 %% give a chance to send data to logger server. but firstly, we must check the sending status. only do it when sending = false.
 %% if sending = true, it will be triggered automatically.
 %% update plc status here.
-put_chars(Chars, #state{index=?MAX_INDEX, table_p_index=TPI, table_c_index=TCI, handler=Handler, sending=Sending}=State) ->
+put_chars(Chars, #state{index=?MAX_INDEX, table_p_index=TPI, 
+						table_c_index=TCI, 
+						handler=Handler, sending=Sending}=State) ->
     Table = get_next_table(TPI),
     NewTPI = get_next_table_index(TPI),
     Plc = is_plc_overload(NewTPI, TCI),
@@ -166,15 +211,11 @@ put_chars(Chars, #state{index=?MAX_INDEX, table_p_index=TPI, table_c_index=TCI, 
     put_chars(Chars, NewState);
 put_chars(Chars, #state{table=T, index=I, plc=Plc}=State) ->
     case Plc of
-        no ->
-            ets:insert(T, {I, Chars}),
-            {ok, ok, State#state{index=I+1}};
-        yes ->
-            %% check priority
-            ets:insert(T, {I, Chars}),
-            {ok, ok, State#state{index=I+1}}; 
-        stop ->
-            {ok, ok, State}
+	stop ->
+	    {ok, ok, State};
+        _ ->
+	    ets:insert(T, {I, Chars}),
+            {ok, ok, State#state{index=I+1}}
     end.              
 
 get_table_name(Index) ->
@@ -208,22 +249,42 @@ is_plc_overload(TP, TC) ->
     D = get_free(TP, TC),
     M = memory_overload(),
     C = cpu_overload(),
-    io:format("*** current status {full, free, memory, cpu}:~n~p~n", [{F, D, M, C}]),
+    %io:format("*** current status {full, free, memory, cpu}:~n~p~n", [{F, D, M, C}]),
     case {F, D, M, C} of
         {yes, _, _, _} -> stop;
         {no, 0, _, _} -> yes;
         {no, 1, _, _} -> yes;
         {no, _, no, no} -> no;
-        {no, _, _, _} -> yes		
+        {no, _, stop, _} -> stop;
+	{no, _, _, stop} -> stop;
+	{no, _, _, _} -> yes
     end.
 
 memory_overload() ->
     %% if memory usage exceed 80%, return yes, or return no.
-    no.
+    {Total, Free} = res_monitor:memory_util(),
+	Usage = round((Total - Free) * 100 / Total),
+	case Usage >= 80 of
+		true -> 
+                        io:format("memory usage: ~p~n", [Usage]),
+			case Usage >= 90 of
+				true -> stop;
+				false -> yes
+			end;
+        false -> no
+	end.
 
 cpu_overload() ->
-    %% if run_queue is more than 1000, return yes, or return no.
-    no.
+    Cpu = res_monitor:cpu_util(),
+	case Cpu >= 80 of
+		true -> 
+                        io:format("cpu usage: ~p~n", [Cpu]),
+			case Cpu >= 90 of
+				true -> stop;
+				false -> yes
+			end;
+		false -> no
+    end.
 
 delete_all_table() ->
     [ets:delete(get_table_name(Index)) || Index <- lists:seq(1, ?MAX_TABLE)].

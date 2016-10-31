@@ -16,7 +16,7 @@
 -define(DATE_FORMAT, "~4.4.0w-~2.2.0w-~2.2.0wT~2.2.0w:~2.2.0w:~2.2.0wZ\t").
 
 %% API
--export([start_link/0, add_handler/0, add_handler/1, log/2, error/2, error/1, warn/2, warn/1, info/2, info/1, console/2, console/1]).
+-export([start_link/0, stop/0, add_handler/0, add_handler/1, delete_handler/0, log/2, error/2, error/1, warn/2, warn/1, info/2, info/1, console/2, console/1]).
 
 %% gen_event callbacks
 -export([init/1, handle_event/2, handle_call/2, handle_info/2, terminate/2, code_change/3]).
@@ -40,6 +40,9 @@
 start_link() ->
     gen_event:start_link({local, ?SERVER}). 
 
+stop() ->
+	gen_event:stop(error_logger).
+
 %%--------------------------------------------------------------------
 %% @spec add_handler() -> ok | {'EXIT',Reason} | term()
 %% @doc Start without any arguments.
@@ -56,6 +59,9 @@ add_handler() ->
 %%--------------------------------------------------------------------
 add_handler(PropList) ->
     gen_event:add_handler(error_logger, ?MODULE, PropList).
+
+delete_handler() ->
+	gen_event:delete_handler(error_logger, ?MODULE, []).
 
 %%--------------------------------------------------------------------
 %% @spec log(Class, Message) -> ok
@@ -269,6 +275,7 @@ terminate(_Reason, State) ->
 %    NewState = write_log_file(State, {info, "Shutting down ~p (~p)~n", 
 %			   [?SERVER, Reason]}),
 %    CurrentFD = NewState#state.current_fd,
+    io:format("terminate it, State is ~p~n", [State]),
     CurrentFD = State#state.current_fd,
     file:close(CurrentFD),
     ok.

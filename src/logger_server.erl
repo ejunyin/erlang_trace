@@ -20,6 +20,7 @@ stop() ->
 %% Behavioural functions 
 %% ====================================================================
 -record(state, {listen_pid = undefined, listen_socket = undefined, ets = undefined}).
+-record(s1, {socket=undefined, rest=[]}).
 
 -define(LISTEN_PORT, 12345).
 -define(LOGGER_FOLDER, ".").
@@ -67,6 +68,7 @@ init([]) ->
 %% ====================================================================
 handle_call(stop, _From, State) ->
 	terminate(stop, State),
+	%rotating_logger:stop(),
     {stop, normal, stopped, State};
 handle_call(_Request, _From, State) ->
     Reply = ok,
@@ -164,13 +166,50 @@ loop_listen(ListenSocket, From) ->
 spawn_handle_log_process(Socket) ->
     _From = self(),
     {ok, {_PeerAddress, _}} = inet:peername(Socket),
-    spawn_link(fun() -> loop_handler(Socket) end).
+    spawn_link(fun() ->
+					   LoopData = #s1{socket=Socket, rest=[]},
+					   loop_handler(LoopData) 
+			   end).
 
-loop_handler(Socket) ->
+parse_data(Rest, Bin) ->
+	case Rest of
+		[] ->
+			<<Len:6/binary, Binary/binary>> = Bin,
+			TotalLen = binary_to_term(Len) + 6,
+			case size(Bin) of
+				TotalLen ->
+					{ok, Binary, []};
+				_ ->
+					{ok, Bin}
+			end;
+		_ ->
+            <<Len:6/binary, Binary/binary>> = Rest,
+			TotalLen = binary_to_term(Len) + 6,
+			case size(Rest) + size(Bin) of
+				TotalLen ->
+					{ok, <<Binary/binary, Bin/binary>>, []};
+				_ ->
+					{ok, <<Rest/binary, Bin/binary>>}
+			end
+    end.
+
+save_data(Data) ->
+    Objs = binary_to_term(Data),
+	[rotating_logger:log(log, list_to_binary(Obj)) || {_Key, Obj} <- Objs].
+	
+loop_handler(LoopData=#s1{socket=Socket, rest=Rest}) ->
     receive
 		{tcp, Socket, Bin} ->
-            rotating_logger:log(log, Bin),
-            loop_handler(Socket);
+			case parse_data(Rest, Bin) of
+				{ok, Binary, NewRest} ->
+					io:format("received Bin size is ~p~n", [size(Binary)]),
+					Data = zlib:unzip(Binary),
+					save_data(Data),
+					loop_handler(LoopData#s1{rest=NewRest});
+				{ok, NewRest} ->
+					loop_handler(LoopData#s1{rest=NewRest})
+            end;                
+			%rotating_logger:log(log, Bin),
 		{tcp_closed, Socket} ->
 			io:format("Server socket be closed~n");
 		stop ->
